@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Face Mask Detection - Live CNN</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Arial, sans-serif; }
+  body {
+    background: linear-gradient(135deg, #1e3c72, #2a5298);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 30px 15px;
+    color: #fff;
+  }
+  h1 { text-align: center; }
+  p.subtitle { opacity: 0.85; margin: 6px 0 20px; text-align: center; max-width: 500px; }
+  .card {
+    background: rgba(255,255,255,0.08);
+    backdrop-filter: blur(6px);
+    border-radius: 16px;
+    padding: 25px;
+    width: 100%;
+    max-width: 560px;
+    text-align: center;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+  }
+  #video-wrap { position: relative; width: 480px; max-width: 100%; margin: 15px auto; }
+  video, canvas { border-radius: 10px; }
+  video { display: block; width: 100%; }
+  canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+  button {
+    background: #ff6f61;
+    color: #fff;
+    border: none;
+    padding: 12px 25px;
+    font-size: 16px;
+    border-radius: 30px;
+    cursor: pointer;
+    margin: 8px 5px;
+    transition: 0.3s;
+  }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button:hover:not(:disabled) { background: #ff3b2f; transform: scale(1.05); }
+  #status { margin-top: 12px; font-size: 15px; min-height: 22px; }
+  .mask { color: #4caf50; font-weight: bold; }
+  .nomask { color: #ff5252; font-weight: bold; }
+  .loading { color: #ffd54f; }
+  footer { margin-top: 25px; opacity: 0.7; font-size: 13px; text-align: center; max-width: 500px; }
+</style>
+</head>
+<body>
+
+<h1>😷 Face Mask Detection</h1>
+<p class="subtitle">Live webcam face detection (CNN) with mask/no-mask classification, running entirely in your browser.</p>
+
+<div class="card">
+  <button id="start-btn" onclick="startCam()">Start Camera</button>
+  <button id="stop-btn" onclick="stopCam()" disabled>Stop Camera</button>
+
+  <div id="video-wrap">
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div id="status">Click "Start Camera" and allow webcam access.</div>
+</div>
+
+<footer>
+  Face detection powered by a real convolutional neural network (face-api.js TinyFaceDetector).
+  Mask classification uses a color/texture heuristic on the mouth region — for production-grade
+  accuracy, replace it with a properly trained model (see comments in the code).
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+<script>
+  const MODEL_URL = "https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights/";
+  const video = document.getElementById("video");
+  const overlay = document.getElementById("overlay");
+  const statusEl = document.getElementById("status");
+  const startBtn = document.getElementById("start-btn");
+  const stopBtn = document.getElementById("stop-btn");
+
+  let stream = null;
+  let running = false;
+  let modelsLoaded = false;
+
+  async function loadModels() {
+    if (modelsLoaded) return;
+    statusEl.innerHTML = '<span class="loading">Loading CNN face detection model...</span>';
+    await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+    modelsLoaded = true;
+  }
+
+  async function startCam() {
+    startBtn.disabled = true;
+    try {
+      await loadModels();
+
+      stream = await navigator.mediaDevices.getUserMedia({ video: { width: 480, height: 360 }, audio: false });
+      video.srcObject = stream;
+      await video.play();
+
+      overlay.width = video.videoWidth;
+      overlay.height = video.videoHeight;
+
+      running = true;
+      stopBtn.disabled = false;
+      statusEl.textContent = "Detecting...";
+      detectLoop();
+    } catch (err) {
+      statusEl.textContent = "Camera access denied or unavailable: " + err.message;
+      startBtn.disabled = false;
+    }
+  }
+
+  function stopCam() {
+    running = false;
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+    const ctx = overlay.getContext("2d");
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+    statusEl.textContent = "Camera stopped.";
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+  }
+
+  async function detectLoop() {
+    if (!running) return;
+
+    const detections = await faceapi.detectAllFaces(
+      video,
+      new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 })
+    );
+
+    const ctx = overlay.getContext("2d");
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+    if (detections.length === 0) {
+      statusEl.textContent = "No face detected.";
+    } else {
+      let summary = [];
+      detections.forEach(det => {
+        const box = det.box;
+        const result = classifyMask(box);
+        drawBox(ctx, box, result);
+        summary.push(result.label);
+      });
+      statusEl.innerHTML = summary
+        .map(l => `<span class="${l === 'Mask' ? 'mask' : 'nomask'}">${l}</span>`)
+        .join(" &nbsp;|&nbsp; ");
+    }
+
+    requestAnimationFrame(detectLoop);
+  }
+
+  // Heuristic classifier: samples the lower third of the face box (mouth/nose/chin area)
+  // and compares its color profile against typical skin tones. Low skin-tone match and/or
+  // uniform non-skin color => likely wearing a mask.
+  function classifyMask(box) {
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    const regionX = Math.max(0, box.x + box.width * 0.15);
+    const regionY = box.y + box.height * 0.55;
+    const regionW = box.width * 0.7;
+    const regionH = box.height * 0.4;
+
+    let data;
+    try {
+      data = ctx.getImageData(regionX, regionY, regionW, regionH).data;
+    } catch (e) {
+      return { label: "Unknown", confidence: 0 };
+    }
+
+    let skinPixels = 0, total = 0;
+    let rSum = 0, gSum = 0, bSum = 0;
+
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      total++;
+      rSum += r; gSum += g; bSum += b;
+      if (isSkinTone(r, g, b)) skinPixels++;
+    }
+
+    const skinRatio = skinPixels / total;
+    const avgR = rSum / total, avgG = gSum / total, avgB = bSum / total;
+    const colorVariance = Math.abs(avgR - avgG) + Math.abs(avgG - avgB) + Math.abs(avgR - avgB);
+
+    // Low skin ratio => something is covering the mouth/nose area
+    const maskLikely = skinRatio < 0.35;
+
+    return {
+      label: maskLikely ? "Mask" : "No Mask",
+      confidence: maskLikely ? (1 - skinRatio) : skinRatio
+    };
+  }
+
+  function isSkinTone(r, g, b) {
+    return (
+      r > 60 && g > 30 && b > 15 &&
+      r > g && r > b &&
+      Math.abs(r - g) > 10 &&
+      (r - b) > 10
+    );
+  }
+
+  function drawBox(ctx, box, result) {
+    ctx.strokeStyle = result.label === "Mask" ? "#4caf50" : "#ff5252";
+    ctx.lineWidth = 3;
+    ctx.strokeRect(box.x, box.y, box.width, box.height);
+
+    ctx.fillStyle = result.label === "Mask" ? "#4caf50" : "#ff5252";
+    ctx.font = "16px Segoe UI";
+    const text = `${result.label} (${(result.confidence * 100).toFixed(0)}%)`;
+    const textWidth = ctx.measureText(text).width;
+    ctx.fillRect(box.x, box.y - 22, textWidth + 10, 22);
+    ctx.fillStyle = "#fff";
+    ctx.fillText(text, box.x + 5, box.y - 6);
+  }
+</script>
+
+</body>
+</html>
